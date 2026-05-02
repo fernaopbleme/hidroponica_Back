@@ -1,69 +1,32 @@
 import asyncio
-
 import json
 from datetime import datetime
 from typing import List, Dict, Any
+from contextlib import asynccontextmanager
 
 import paho.mqtt.client as mqtt
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
-from contextlib import asynccontextmanager
-from fastapi import WebSocket, WebSocketDisconnect
 
-event_loop = None
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global event_loop
 
-    event_loop = asyncio.get_running_loop()
+# =========================
+# CONFIGURAÇÕES MQTT
+# =========================
 
-    print("Iniciando conexão MQTT...")
-    mqtt_client.connect(BROKER, PORT, 60)
-    mqtt_client.loop_start()
-
-    yield
-
-    print("Encerrando conexão MQTT...")
-    mqtt_client.loop_stop()
-    mqtt_client.disconnect()
-
-app = FastAPI(lifespan=lifespan)
-# Lista de clientes WebSocket conectados
-clientes_websocket: List[WebSocket] = []
-# WebSocket para enviar dados em tempo real para o Flutter/front-end
-@app.websocket("/ws/sensores")
-async def websocket_sensores(websocket: WebSocket):
-    await websocket.accept()
-    clientes_websocket.append(websocket)
-
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        clientes_websocket.remove(websocket)
-
-# Libera acesso do Flutter/front-end (apenas HTTP, não interfere com WebSocket)
-@app.middleware("http")
-async def cors_middleware(request: Request, call_next):
-    if request.method == "OPTIONS":
-        response = Response()
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "*"
-        response.headers["Access-Control-Allow-Headers"] = "*"
-        return response
-    response = await call_next(request)
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    return response
-
-# Configuração MQTT para receber dados dos sensores mockados
 BROKER = "broker.hivemq.com"
-PORT = 1883
+PORT = 8883  # Porta MQTT com TLS
 TOPIC = "aeroponia/sensores/dados"
 
-# Último dado recebido
-ultimo_dado = None
 
-# Thresholds iniciais
+# =========================
+# VARIÁVEIS GLOBAIS
+# =========================
+
+event_loop = None
+ultimo_dado = None
+ultimos_alertas: List[str] = []
+clientes_websocket: List[WebSocket] = []
+
 thresholds = {
     "phMin": 5.5,
     "phMax": 6.5,
@@ -75,9 +38,10 @@ thresholds = {
     "nivelAguaMin": 35,
 }
 
-# Últimos alertas gerados
-ultimos_alertas: List[str] = []
 
+# =========================
+# PROCESSAMENTO DOS DADOS
+# =========================
 
 def processar_dados(dados: Dict[str, Any]) -> List[str]:
     alertas = []
@@ -109,15 +73,9 @@ def processar_dados(dados: Dict[str, Any]) -> List[str]:
     return alertas
 
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print("Backend conectado ao broker MQTT.")
-        client.subscribe(TOPIC)
-        print(f"Backend inscrito no tópico: {TOPIC}")
-    else:
-        print(f"Erro ao conectar no MQTT. Código: {rc}")
-
-#Mandando dados para o flutter/front-end em tempo real via WebSocket
+# =========================
+# WEBSOCKET
+# =========================
 
 async def enviar_para_flutter(payload):
     clientes_desconectados = []
@@ -133,10 +91,27 @@ async def enviar_para_flutter(payload):
             clientes_websocket.remove(websocket)
 
 
+# =========================
+# MQTT CALLBACKS
+# =========================
+
+def on_connect(client, userdata, flags, rc):
+    print(f"on_connect chamado. Código: {rc}", flush=True)
+
+    if rc == 0:
+        print("Backend conectado ao broker MQTT com TLS.", flush=True)
+        client.subscribe(TOPIC)
+        print(f"Backend inscrito no tópico: {TOPIC}", flush=True)
+    else:
+        print(f"Erro ao conectar no MQTT. Código: {rc}", flush=True)
+
+
 def on_message(client, userdata, msg):
     global ultimo_dado, ultimos_alertas
 
     try:
+        print("Mensagem MQTT recebida.", flush=True)
+
         payload = msg.payload.decode("utf-8")
         dados = json.loads(payload)
 
@@ -150,8 +125,8 @@ def on_message(client, userdata, msg):
 
         ultimos_alertas = alertas
 
-        print("Dados recebidos do MQTT:")
-        print(ultimo_dado)
+        print("Dados processados:", flush=True)
+        print(ultimo_dado, flush=True)
 
         if event_loop is not None:
             asyncio.run_coroutine_threadsafe(
@@ -160,19 +135,93 @@ def on_message(client, userdata, msg):
             )
 
     except Exception as e:
-        print("Erro ao processar mensagem MQTT:", e)
+        print(f"Erro ao processar mensagem MQTT: {e}", flush=True)
 
 
-mqtt_client = mqtt.Client()
+# =========================
+# CLIENTE MQTT
+# =========================
+
+mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+mqtt_client.tls_set()
 mqtt_client.on_connect = on_connect
 mqtt_client.on_message = on_message
 
+
+# =========================
+# LIFESPAN FASTAPI
+# =========================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global event_loop
+
+    event_loop = asyncio.get_running_loop()
+
+    print("Iniciando conexão MQTT...", flush=True)
+    print(f"Broker: {BROKER}", flush=True)
+    print(f"Porta: {PORT}", flush=True)
+    print(f"Tópico: {TOPIC}", flush=True)
+
+    mqtt_client.connect(BROKER, PORT, 60)
+    mqtt_client.loop_start()
+
+    yield
+
+    print("Encerrando conexão MQTT...", flush=True)
+    mqtt_client.loop_stop()
+    mqtt_client.disconnect()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+# =========================
+# CORS HTTP
+# =========================
+
+@app.middleware("http")
+async def cors_middleware(request: Request, call_next):
+    if request.method == "OPTIONS":
+        response = Response()
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "*"
+        return response
+
+    response = await call_next(request)
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+# =========================
+# ROTAS WEBSOCKET
+# =========================
+
+@app.websocket("/ws/sensores")
+async def websocket_sensores(websocket: WebSocket):
+    await websocket.accept()
+    clientes_websocket.append(websocket)
+
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        if websocket in clientes_websocket:
+            clientes_websocket.remove(websocket)
+
+
+# =========================
+# ROTAS HTTP
+# =========================
 
 @app.get("/")
 def home():
     return {
         "message": "Backend Aeroponia rodando",
-        "mqttTopic": TOPIC
+        "mqttTopic": TOPIC,
+        "mqttBroker": BROKER,
+        "mqttPort": PORT
     }
 
 
